@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+  <title>Face scan — capture, align by eyes, crop & download</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#111;color:#eee;display:flex;flex-direction:column;align-items:center;gap:12px;padding:12px}
+    video, canvas{max-width:100%;border-radius:8px}
+    .controls{display:flex;gap:8px;flex-wrap:wrap}
+    button,input{padding:8px 12px;border-radius:8px;border:1px solid #333;background:#222;color:#eee}
+    .note{font-size:13px;opacity:.9;max-width:720px}
+  </style>
+</head>
+<body>
+  <h2>Face scan — align by eyes, crop & download</h2>
+
+  <video id="video" autoplay muted playsinline width="640" height="480"></video>
+  <canvas id="overlay" width="640" height="480" style="position:relative;display:block;"></canvas>
+
+  <div class="controls">
+    <button id="snap">Capture & Process</button>
+    <button id="download" disabled>Download result</button>
+    <label><input id="useFront" type="checkbox" checked> Front camera (selfie)</label>
+    <label>Filename: <input id="filename" value="face_scan_" style="width:140px"></label>
+  </div>
+
+  <p class="note">How this works: the page captures camera frames, detects face & facial landmarks (eyes). It computes the angle between eyes, rotates the image to make eyes horizontal, crops a square region around the face, and produces a downloadable JPG. <strong>Important:</strong> you must host the HTML over HTTPS (or run on localhost) for camera access on iPhone. You also need the face-api.js model files placed in a ./models/ folder next to this file (see instructions below).</p>
+
+  <p class="note" id="status">Status: idle</p>
+
+  <!-- face-api.js from unpkg -->
+  <script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script>
+  // ---------- Configuration ----------
+  const MODEL_PATH = './models' // put model files here (see README comment below)
+  const video = document.getElementById('video')
+  const overlay = document.getElementById('overlay')
+  const ctx = overlay.getContext('2d')
+  const statusEl = document.getElementById('status')
+
+  async function setStatus(t){ statusEl.textContent = 'Status: ' + t }
+
+  // load models
+  async function loadModels(){
+    setStatus('loading models...')
+    // tiny face detector + landmark model is lighter and usually good for eye detection
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_PATH)
+    await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_PATH)
+    setStatus('models loaded')
+  }
+
+  // start camera
+  async function startCamera(){
+    const useFront = document.getElementById('useFront').checked
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: useFront ? 'user' : 'environment',
+        width: { ideal: 1280 },
+        height: { ideal: 960 }
+      }
+    }
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      video.srcObject = stream
+      await video.play()
+      overlay.width = video.videoWidth || 640
+      overlay.height = video.videoHeight || 480
+      setStatus('camera started')
+    }catch(e){
+      console.error(e); setStatus('camera error: '+e.message)
+    }
+  }
+
+  // compute center point of an array of points
+  function centerPoint(points){
+    const sum = points.reduce((acc,p)=>({x:acc.x+p.x,y:acc.y+p.y}),{x:0,y:0})
+    return {x: sum.x/points.length, y: sum.y/points.length}
+  }
+
+  // rotate image in canvas and return a new canvas
+  function rotateCanvasImage(srcCanvas, angleRad){
+    const c = document.createElement('canvas')
+    const w = srcCanvas.width, h = srcCanvas.height
+    // compute bounding box for rotated image
+    const sin = Math.abs(Math.sin(angleRad)), cos = Math.abs(Math.cos(angleRad))
+    c.width = Math.round(w * cos + h * sin)
+    c.height = Math.round(w * sin + h * cos)
+    const g = c.getContext('2d')
+    g.translate(c.width/2, c.height/2)
+    g.rotate(angleRad)
+    g.drawImage(srcCanvas, -w/2, -h/2)
+    return c
+  }
+
+  // crop a square region centered at cx,cy with size s from canvas (clamped to bounds)
+  function cropSquareFromCanvas(srcCanvas, cx, cy, s){
+    const c = document.createElement('canvas')
+    c.width = s; c.height = s
+    const g = c.getContext('2d')
+    const sx = Math.round(cx - s/2), sy = Math.round(cy - s/2)
+    g.drawImage(srcCanvas, sx, sy, s, s, 0, 0, s, s)
+    return c
+  }
+
+  // main capture -> detect -> align -> crop -> preview
+  async function captureAndProcess(){
+    setStatus('capturing frame')
+    // draw current video into a temp canvas
+    const temp = document.createElement('canvas')
+    temp.width = video.videoWidth
+    temp.height = video.videoHeight
+    const tctx = temp.getContext('2d')
+    tctx.drawImage(video, 0, 0, temp.width, temp.height)
+
+    setStatus('detecting face & landmarks')
+    const detections = await faceapi.detectAllFaces(temp, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks(true)
+    ctx.clearRect(0,0,overlay.width,overlay.height)
+    if(!detections || detections.length===0){ setStatus('no face detected') ; alert('No face detected — try moving camera closer or ensure face is visible') ; return }
+
+    // choose largest detection (closest face)
+    let best = detections[0]
+    let bestArea = 0
+    for(const d of detections){ const r = d.detection.box; const area = r.width*r.height; if(area>bestArea){ best = d; bestArea = area } }
+
+    const box = best.detection.box
+    const landmarks = best.landmarks
+    const leftEyePts = landmarks.getLeftEye()
+    const rightEyePts = landmarks.getRightEye()
+
+    const leftC = centerPoint(leftEyePts)
+    const rightC = centerPoint(rightEyePts)
+
+    // compute angle to rotate so eyes are horizontal
+    const dy = rightC.y - leftC.y
+    const dx = rightC.x - leftC.x
+    const angle = Math.atan2(dy, dx) // radians
+    const angleDeg = angle * 180/Math.PI
+
+    // draw debugging overlay
+    ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.rect(box.x, box.y, box.width, box.height); ctx.stroke()
+    ctx.fillStyle = 'rgba(255,255,0,0.7)'
+    ctx.beginPath(); ctx.arc(leftC.x, leftC.y, 4,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(rightC.x, rightC.y,4,0,Math.PI*2); ctx.fill()
+
+    setStatus('rotating image by ' + (-angleDeg).toFixed(2) + '° and cropping')
+
+    // rotate the temp canvas by -angle (so eyes become horizontal)
+    const rotated = rotateCanvasImage(temp, -angle)
+
+    // compute coordinates of face center in rotated canvas
+    // we need to transform point from original temp coords to rotated canvas coords
+    // approach: compute transform used in rotateCanvasImage — we can map point -> translate to center -> rotate -> translate
+
+    function transformPointToRotated(px, py, srcW, srcH, outW, outH, angleRad){
+      // move origin to center of src
+      const cx = px - srcW/2, cy = py - srcH/2
+      // rotate by -angleRad (because we rotated the image by angleRad into the new canvas in function)
+      const cos = Math.cos(angleRad), sin = Math.sin(angleRad)
+      const rx = cx * cos - cy * sin
+      const ry = cx * sin + cy * cos
+      // translate to out center
+      return { x: Math.round(outW/2 + rx), y: Math.round(outH/2 + ry) }
+    }
+
+    const outW = rotated.width, outH = rotated.height
+    const srcW = temp.width, srcH = temp.height
+    // choose center as detection box center
+    const faceCenter = { x: box.x + box.width/2, y: box.y + box.height/2 }
+    const faceCenterRot = transformPointToRotated(faceCenter.x, faceCenter.y, srcW, srcH, outW, outH, -angle)
+
+    // choose crop size: make it square, scale based on detected box and a padding factor
+    const scale = 1.6
+    const s = Math.round(Math.max(box.width, box.height) * scale)
+    // ensure within bounds; clamp s to no more than rotated dims
+    const finalS = Math.min(s, outW, outH)
+
+    const cropped = cropSquareFromCanvas(rotated, faceCenterRot.x, faceCenterRot.y, finalS)
+
+    // show result in overlay by replacing its content
+    overlay.width = cropped.width; overlay.height = cropped.height
+    ctx.drawImage(cropped, 0, 0)
+
+    // enable download button
+    const downloadBtn = document.getElementById('download')
+    downloadBtn.disabled = false
+    // attach data URL to button
+    downloadBtn.onclick = ()=>{
+      const filenameBase = document.getElementById('filename').value || 'face_scan_'
+      const ts = new Date().toISOString().replace(/[:.]/g,'-')
+      const fname = filenameBase + ts + '.jpg'
+      const a = document.createElement('a')
+      a.href = overlay.toDataURL('image/jpeg', 0.92)
+      a.download = fname
+      a.click()
+    }
+
+    setStatus('done — preview shown. Click "Download result" to save')
+  }
+
+  // wire up UI
+  document.getElementById('snap').addEventListener('click', ()=>{
+    captureAndProcess().catch(e=>{console.error(e); setStatus('error: '+e.message)})
+  })
+
+  document.getElementById('useFront').addEventListener('change', ()=>{
+    // restart camera with new facingMode
+    if(video.srcObject){ video.srcObject.getTracks().forEach(t=>t.stop()) }
+    startCamera().catch(e=>console.error(e))
+  })
+
+  // init
+  (async ()=>{
+    try{
+      await loadModels()
+      await startCamera()
+    }catch(e){ console.error(e); setStatus('init error: ' + (e.message||e)) }
+  })()
+
+  </script>
+
+<!--
+Instructions / Notes for use:
+1. This file expects face-api.js weights/models (tiny_face_detector_model-weights_manifest.json and related bin files, and the face_landmark_68_tiny model) to be placed in a "models" folder next to this HTML file.
+   You can download the models from the face-api.js repo and copy them into ./models. Example required files:
+     - tiny_face_detector_model-weights_manifest.json
+     - tiny_face_detector_model-shard1
+     - face_landmark_68_tiny_model-weights_manifest.json
+     - face_landmark_68_tiny_model-shard1
+
+   If you don't want to host models locally, change MODEL_PATH to a public URL that serves those files.
+
+2. On iPhone (Safari): camera access requires HTTPS or localhost. To test on your phone, either host the file on a web server with HTTPS (e.g., GitHub Pages) or run a local server on your computer and access it via your machine's IP over HTTPS.
+
+3. The code uses a lightweight tiny face detector to keep it reasonably fast on mobile. If detection fails, try moving closer, better lighting, or use a higher-res camera if available.
+
+4. This single-file approach keeps everything in one HTML. The heavy part is the model files which are separate binary files. If you want a fully self-contained single file (models embedded), that's possible but will make the HTML extremely large.
+-->
+
+</body>
+</html>
