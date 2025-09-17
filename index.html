@@ -1,121 +1,136 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Photo Splitter</title>
-  <style>
-    body {font-family:sans-serif;margin:1rem;}
-    input[type=file]{margin-bottom:1rem;}
-    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
-    .cell{border:1px solid #ccc;padding:4px;text-align:center;}
-    canvas{max-width:100%;height:auto;display:block;margin:auto;}
-  </style>
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Photo Splitter & Renamer</title>
+<style>
+  body{font-family:sans-serif;margin:1rem;}
+  input[type=file]{margin-bottom:1rem;}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
+  .cell{border:1px solid #ccc;padding:4px;text-align:center;}
+  canvas{max-width:100%;display:block;margin:auto;}
+  .btn{margin-top:4px;}
+</style>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-  <h1>Photo Splitter</h1>
-  <input type="file" id="fileInput" accept="image/*">
-  <div id="output" class="grid"></div>
+<h1>Photo Splitter & Renamer</h1>
+<input type="file" id="fileInput" accept="image/*">
+<div id="output" class="grid"></div>
 
-  <script>
-  function trimBlackBorders(src,threshold=20){
-    let gray=new cv.Mat();
-    cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY,0);
-    let mask=new cv.Mat();
-    cv.threshold(gray,mask,threshold,255,cv.THRESH_BINARY);
-    let contours=new cv.MatVector();
-    let hierarchy=new cv.Mat();
-    cv.findContours(mask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
-    let rect=new cv.Rect(0,0,src.cols,src.rows);
-    if(contours.size()>0){
-      let biggestArea=0;
-      for(let i=0;i<contours.size();i++){
-        let area=cv.contourArea(contours.get(i));
-        if(area>biggestArea){
-          biggestArea=area;
-          rect=cv.boundingRect(contours.get(i));
-        }
+<script>
+function trimBlackBorders(src,threshold=20){
+  let gray=new cv.Mat();
+  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY,0);
+  let mask=new cv.Mat();
+  cv.threshold(gray,mask,threshold,255,cv.THRESH_BINARY);
+  let contours=new cv.MatVector();
+  let hierarchy=new cv.Mat();
+  cv.findContours(mask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+  let rect=new cv.Rect(0,0,src.cols,src.rows);
+  if(contours.size()>0){
+    let maxA=0;
+    for(let i=0;i<contours.size();i++){
+      let area=cv.contourArea(contours.get(i));
+      if(area>maxA){
+        maxA=area;
+        rect=cv.boundingRect(contours.get(i));
       }
     }
-    let trimmed=src.roi(rect);
-    gray.delete();mask.delete();contours.delete();hierarchy.delete();
-    return trimmed.clone(); // clone then return
   }
+  let trimmed=src.roi(rect).clone();
+  gray.delete();mask.delete();contours.delete();hierarchy.delete();
+  return trimmed;
+}
 
-  function onFileSelected(e){
-    const file=e.target.files[0];
-    if(!file) return;
-    const reader=new FileReader();
-    reader.onload=function(ev){
-      const img=new Image();
-      img.onload=function(){
-        processImage(img);
-      };
-      img.src=ev.target.result;
-    };
-    reader.readAsDataURL(file);
-  }
+function onFileSelected(e){
+  const file=e.target.files[0];
+  if(!file)return;
+  const reader=new FileReader();
+  reader.onload=function(ev){
+    const img=new Image();
+    img.onload=function(){processImage(img);};
+    img.src=ev.target.result;
+  };
+  reader.readAsDataURL(file);
+}
 
-  function processImage(img){
-    let src=cv.imread(img);
-    let rows=4; // number of rows you want
-    let cols=4; // number of columns you want
-    let cellW=Math.floor(src.cols/cols);
-    let cellH=Math.floor(src.rows/rows);
+function downloadCanvas(canvas,filename){
+  canvas.toBlob(function(blob){
+    const link=document.createElement('a');
+    link.download=filename;
+    link.href=URL.createObjectURL(blob);
+    link.click();
+    URL.revokeObjectURL(link.href);
+  },'image/png');
+}
 
-    let output=document.getElementById('output');
-    output.innerHTML='';
-    let counter=1;
+function processImage(img){
+  let src=cv.imread(img);
+  let rows=4; // adjust
+  let cols=4; // adjust
+  let cellW=Math.floor(src.cols/cols);
+  let cellH=Math.floor(src.rows/rows);
 
-    for(let r=0;r<rows;r++){
-      for(let c=0;c<cols;c++){
-        let rect=new cv.Rect(c*cellW,r*cellH,cellW,cellH);
-        let roi=src.roi(rect);
+  const out=document.getElementById('output');
+  out.innerHTML='';
+  let counter=1;
 
-        // perspective correction & trimming
-        let trimmed=trimBlackBorders(roi,20);
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      let rect=new cv.Rect(c*cellW,r*cellH,cellW,cellH);
+      let roi=src.roi(rect);
 
-        // optional rotation check
-        let finalMat=trimmed; // already a new mat
-        if(finalMat.rows<finalMat.cols){
-          let rotated=new cv.Mat();
-          cv.rotate(finalMat,rotated,cv.ROTATE_90_CLOCKWISE);
-          finalMat.delete();
-          finalMat=rotated;
-        }
+      let trimmed=trimBlackBorders(roi,20);
 
-        // show on canvas
-        let canvas=document.createElement('canvas');
-        cv.imshow(canvas,finalMat);
-
-        // cleanup
-        roi.delete();
-        trimmed.delete();
+      // optional rotation like Python
+      let finalMat=trimmed;
+      if(finalMat.rows<finalMat.cols){
+        let rotated=new cv.Mat();
+        cv.rotate(finalMat,rotated,cv.ROTATE_90_CLOCKWISE);
         finalMat.delete();
-
-        let cellDiv=document.createElement('div');
-        cellDiv.className='cell';
-        let label=document.createElement('input');
-        label.type='text';
-        label.value=`Photo_${counter}`;
-        label.addEventListener('keydown',(ev)=>{
-          if(ev.key==='Enter'){
-            ev.preventDefault();
-            // you can implement save logic here
-            alert(`Saved ${label.value}`);
-          }
-        });
-        cellDiv.appendChild(canvas);
-        cellDiv.appendChild(label);
-        output.appendChild(cellDiv);
-        counter++;
+        finalMat=rotated;
       }
-    }
-    src.delete();
-  }
 
-  document.getElementById('fileInput').addEventListener('change',onFileSelected);
-  </script>
+      // draw to canvas
+      let canvas=document.createElement('canvas');
+      cv.imshow(canvas,finalMat);
+
+      // cleanup mats
+      roi.delete();
+      trimmed.delete();
+      finalMat.delete();
+
+      // create UI for renaming & download
+      const cell=document.createElement('div');
+      cell.className='cell';
+      const input=document.createElement('input');
+      input.type='text';
+      input.value=`photo_${counter}`;
+      input.addEventListener('keydown',ev=>{
+        if(ev.key==='Enter'){
+          ev.preventDefault();
+          downloadCanvas(canvas,input.value+'.png');
+        }
+      });
+      const btn=document.createElement('button');
+      btn.textContent='Save';
+      btn.className='btn';
+      btn.onclick=()=>downloadCanvas(canvas,input.value+'.png');
+
+      cell.appendChild(canvas);
+      cell.appendChild(input);
+      cell.appendChild(btn);
+      out.appendChild(cell);
+
+      counter++;
+    }
+  }
+  src.delete();
+}
+
+document.getElementById('fileInput').addEventListener('change',onFileSelected);
+</script>
 </body>
 </html>
