@@ -1,345 +1,121 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Photo Splitter — HTML + JavaScript (single file)</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Photo Splitter</title>
   <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:14px}
-    h1{font-size:1.2rem}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .controls{margin:8px 0}
-    canvas{border:1px solid #ddd;max-width:100%}
-    .thumb{width:180px;height:120px;object-fit:cover;border:1px solid #ccc}
-    .preview-area{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
-    .status{font-size:0.9rem;color:#444}
-    button{padding:8px 12px}
-    input[type=text]{padding:6px;width:260px}
+    body {font-family:sans-serif;margin:1rem;}
+    input[type=file]{margin-bottom:1rem;}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+    .cell{border:1px solid #ccc;padding:4px;text-align:center;}
+    canvas{max-width:100%;height:auto;display:block;margin:auto;}
   </style>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-  <h1>Photo Splitter (single HTML + JS)</h1>
-  <p>Upload a scanned image that contains multiple photos. Uses OpenCV.js for detection and perspective correction. After extraction you can rename each and download it.</p>
+  <h1>Photo Splitter</h1>
+  <input type="file" id="fileInput" accept="image/*">
+  <div id="output" class="grid"></div>
 
-  <div class="controls">
-    <input id="fileInput" type="file" accept="image/*">
-    <label> Min area ratio: <input id="minAreaRatio" type="number" value="0.0005" step="0.0001" style="width:90px"></label>
-    <label> Columns: <input id="columns" type="number" value="4" min="1" style="width:60px"></label>
-    <button id="processBtn" disabled>Process</button>
-    <button id="downloadAll" disabled>Download All as ZIP</button>
-  </div>
-
-  <div id="status" class="status">OpenCV loading...</div>
-
-  <hr>
-  <div class="row">
-    <div style="flex:1;min-width:320px">
-      <canvas id="srcCanvas"></canvas>
-    </div>
-    <div style="width:360px">
-      <div class="preview-area">
-        <img id="previewImg" class="thumb">
-        <div>
-          <input id="nameInput" type="text" placeholder="Type new name (no extension)" autocomplete="off">
-          <button id="saveNextBtn">Save / Next</button>
-        </div>
-        <div id="renameStatus" class="status"></div>
-      </div>
-    </div>
-  </div>
-
-  <h3>All extracted</h3>
-  <div id="extractedList" class="row"></div>
-
-  <!-- OpenCV.js -->
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
-  // --- Utilities ---
-  function logStatus(s){ document.getElementById('status').textContent = s }
-
-  // Wait until OpenCV is ready
-  function onOpenCvReady(){
-    logStatus('OpenCV ready. Load an image.');
-    document.getElementById('processBtn').disabled = false;
+  function trimBlackBorders(src,threshold=20){
+    let gray=new cv.Mat();
+    cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY,0);
+    let mask=new cv.Mat();
+    cv.threshold(gray,mask,threshold,255,cv.THRESH_BINARY);
+    let contours=new cv.MatVector();
+    let hierarchy=new cv.Mat();
+    cv.findContours(mask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+    let rect=new cv.Rect(0,0,src.cols,src.rows);
+    if(contours.size()>0){
+      let biggestArea=0;
+      for(let i=0;i<contours.size();i++){
+        let area=cv.contourArea(contours.get(i));
+        if(area>biggestArea){
+          biggestArea=area;
+          rect=cv.boundingRect(contours.get(i));
+        }
+      }
+    }
+    let trimmed=src.roi(rect);
+    gray.delete();mask.delete();contours.delete();hierarchy.delete();
+    return trimmed.clone(); // clone then return
   }
 
-  // If opencv.js loads it will set cv and call this
-  if (typeof cv !== 'undefined') {
-    if (cv['onRuntimeInitialized']) cv['onRuntimeInitialized'] = onOpenCvReady;
-    else onOpenCvReady();
-  } else {
-    // fallback: when loaded async, opencv will call global onRuntimeInitialized; define it
-    window.onOpenCvReady = onOpenCvReady;
-    // also try to detect cv periodically
-    let tries=0; const t=setInterval(()=>{ if(window.cv){ clearInterval(t); if(cv['onRuntimeInitialized']) cv['onRuntimeInitialized']=onOpenCvReady; else onOpenCvReady(); } tries++; if(tries>80){ clearInterval(t); logStatus('Failed to load OpenCV.js'); } },200)
-  }
-
-  // Read file and draw to canvas
-  const fileInput = document.getElementById('fileInput');
-  const srcCanvas = document.getElementById('srcCanvas');
-  const ctx = srcCanvas.getContext('2d');
-  let originalImg = new Image();
-  let extractedImages = [] // {canvas, blob}
-
-  fileInput.addEventListener('change', e=>{
-    const f = e.target.files && e.target.files[0];
-    if(!f) return;
-    const reader = new FileReader();
-    reader.onload = ev=>{
-      originalImg = new Image();
-      originalImg.onload = ()=>{
-        srcCanvas.width = originalImg.width;
-        srcCanvas.height = originalImg.height;
-        ctx.drawImage(originalImg,0,0);
-        logStatus('Image loaded. Click Process.');
+  function onFileSelected(e){
+    const file=e.target.files[0];
+    if(!file) return;
+    const reader=new FileReader();
+    reader.onload=function(ev){
+      const img=new Image();
+      img.onload=function(){
+        processImage(img);
       };
-      originalImg.src = ev.target.result;
+      img.src=ev.target.result;
     };
-    reader.readAsDataURL(f);
-  });
-
-  // --- Image processing functions using OpenCV.js ---
-  function matFromCanvas(canvas){
-    return cv.imread(canvas);
+    reader.readAsDataURL(file);
   }
 
-  function orderPoints(pts){
-    // pts = array of 4 points [[x,y],...]
-    pts.sort((a,b)=>a[0]+a[1]- (b[0]+b[1]));
-    const tl = pts[0];
-    const br = pts[3];
-    pts.sort((a,b)=> (a[0]-a[1]) - (b[0]-b[1]));
-    const tr = pts[0];
-    const bl = pts[3];
-    return [tl,tr,br,bl];
-  }
+  function processImage(img){
+    let src=cv.imread(img);
+    let rows=4; // number of rows you want
+    let cols=4; // number of columns you want
+    let cellW=Math.floor(src.cols/cols);
+    let cellH=Math.floor(src.rows/rows);
 
-  function trimBlackBorders(matSrc, threshold=20){
-    let gray = new cv.Mat();
-    cv.cvtColor(matSrc, gray, cv.COLOR_RGBA2GRAY);
-    let mask = new cv.Mat();
-    cv.threshold(gray, mask, threshold, 255, cv.THRESH_BINARY);
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    if(contours.size()===0){ gray.delete(); mask.delete(); contours.delete(); hierarchy.delete(); return matSrc; }
-    // find largest contour
-    let maxArea = 0, maxi=0;
-    for(let i=0;i<contours.size();i++){ const c=contours.get(i); const area = cv.contourArea(c); if(area>maxArea){ maxArea=area; maxi=i;} }
-    const c = contours.get(maxi);
-    const rect = cv.boundingRect(c);
-    const roi = matSrc.roi(rect);
-    let out = roi.clone();
-    // cleanup
-    gray.delete(); mask.delete(); contours.delete(); hierarchy.delete();
-    return out;
-  }
+    let output=document.getElementById('output');
+    output.innerHTML='';
+    let counter=1;
 
-  function isInside(boxSmall, boxBig){
-    return boxSmall.x >= boxBig.x && boxSmall.y >= boxBig.y && (boxSmall.x+boxSmall.w) <= (boxBig.x+boxBig.w) && (boxSmall.y+boxSmall.h) <= (boxBig.y+boxBig.h);
-  }
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        let rect=new cv.Rect(c*cellW,r*cellH,cellW,cellH);
+        let roi=src.roi(rect);
 
-  function filterInnerContours(contours, bboxes){
-    const keep=[];
-    for(let i=0;i<contours.size();i++){
-      let inside=false; const bi = bboxes[i];
-      for(let j=0;j<bboxes.length;j++){ if(i===j) continue; if(isInside(bboxes[i], bboxes[j])){ inside=true; break; } }
-      if(!inside) keep.push(i);
-    }
-    return keep;
-  }
+        // perspective correction & trimming
+        let trimmed=trimBlackBorders(roi,20);
 
-  function sortContoursFixedGrid(bboxes, columns=4){
-    // bboxes = [{x,y,w,h,index}]
-    // compute centroids
-    bboxes.forEach(b=>{ b.cx = b.x + b.w/2; b.cy = b.y + b.h/2 });
-    bboxes.sort((a,b)=> a.cy - b.cy);
-    const rows=[];
-    for(let i=0;i<bboxes.length;i+=columns){ const row = bboxes.slice(i,i+columns); row.sort((a,b)=> a.cx - b.cx); rows.push(...row); }
-    return rows;
-  }
+        // optional rotation check
+        let finalMat=trimmed; // already a new mat
+        if(finalMat.rows<finalMat.cols){
+          let rotated=new cv.Mat();
+          cv.rotate(finalMat,rotated,cv.ROTATE_90_CLOCKWISE);
+          finalMat.delete();
+          finalMat=rotated;
+        }
 
-  function extractPhotosFromMat(srcMat, minAreaRatio=0.0005, columns=4){
-    // returns array of canvases
-    let img = srcMat.clone();
-    let gray = new cv.Mat();
-    cv.cvtColor(img, gray, cv.COLOR_RGBA2GRAY);
-    let blur = new cv.Mat();
-    let ksize = new cv.Size(11,11);
-    cv.GaussianBlur(gray, blur, ksize, 0);
-    let thresh = new cv.Mat();
-    cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU);
-    // determine foreground/back
-    let fgMean = 0, bgMean = 0;
-    try{
-      let fgMask = new cv.Mat();
-      cv.compare(thresh, new cv.Mat(thresh.rows, thresh.cols, thresh.type(), [255,255,255,255]), fgMask, cv.CMP_EQ);
-      const fgPixels = cv.countNonZero(fgMask);
-      if(fgPixels>0){
-        let fg = new cv.Mat();
-        cv.bitwise_and(gray, gray, fg, thresh);
-        fgMean = cv.mean(fg, thresh)[0];
-        fg.delete();
-      }
-      // bg mean
-      let inv = new cv.Mat();
-      cv.bitwise_not(thresh, inv);
-      if(cv.countNonZero(inv)>0){ let bg = new cv.Mat(); cv.bitwise_and(gray, gray, bg, inv); bgMean = cv.mean(bg, inv)[0]; bg.delete(); }
-      fgMask.delete(); inv.delete();
-    }catch(e){ }
-    if(fgMean < bgMean){ cv.bitwise_not(thresh, thresh); }
-    // morphology close
-    let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7,7));
-    cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel, new cv.Point(-1,-1), 2);
-    // find contours
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    const imgArea = img.rows * img.cols;
-    const minArea = Math.max(2000, Math.floor(minAreaRatio * imgArea));
-    // filter by area and collect bboxes
-    const bboxes=[];
-    for(let i=0;i<contours.size();i++){
-      const c = contours.get(i);
-      const area = cv.contourArea(c);
-      if(area >= minArea){
-        const r = cv.boundingRect(c);
-        r.index = i;
-        bboxes.push(r);
-      }
-    }
-    // filter inner
-    const keepIdx = filterInnerContours(contours, bboxes);
-    const filtered = keepIdx.map(i=>bboxes[i]);
-    // sort fixed grid
-    const sorted = sortContoursFixedGrid(filtered, columns);
-    const outputs = [];
-    for(let j=0;j<sorted.length;j++){
-      const r = sorted[j];
-      // get contour points for minAreaRect
-      const c = contours.get(r.index);
-      const rect = cv.minAreaRect(c);
-      const pts = cv.RotatedRect.points(rect);
-      // convert pts to Mat
-      const srcTri = cv.matFromArray(4,1,cv.CV_32FC2,[pts[0].x,pts[0].y, pts[1].x,pts[1].y, pts[2].x,pts[2].y, pts[3].x,pts[3].y]);
-      // compute destination size
-      const widthA = Math.hypot(pts[2].x-pts[3].x, pts[2].y-pts[3].y);
-      const widthB = Math.hypot(pts[1].x-pts[0].x, pts[1].y-pts[0].y);
-      const maxWidth = Math.max(Math.round(widthA), Math.round(widthB));
-      const heightA = Math.hypot(pts[1].x-pts[2].x, pts[1].y-pts[2].y);
-      const heightB = Math.hypot(pts[0].x-pts[3].x, pts[0].y-pts[3].y);
-      const maxHeight = Math.max(Math.round(heightA), Math.round(heightB));
-      const dstTri = cv.matFromArray(4,1,cv.CV_32FC2,[0,0, maxWidth-1,0, maxWidth-1,maxHeight-1, 0,maxHeight-1]);
-      const M = cv.getPerspectiveTransform(srcTri, dstTri);
-      let warped = new cv.Mat();
-      cv.warpPerspective(img, warped, M, new cv.Size(maxWidth, maxHeight));
-      // trim black borders
-      const trimmed = trimBlackBorders(warped,20);
-      // rotate if needed (match python: if h<w rotate cw)
-      let finalMat = trimmed;
-      if(finalMat.rows < finalMat.cols){ // rotate clockwise
-        let rotated = new cv.Mat();
-        cv.rotate(finalMat, rotated, cv.ROTATE_90_CLOCKWISE);
+        // show on canvas
+        let canvas=document.createElement('canvas');
+        cv.imshow(canvas,finalMat);
+
+        // cleanup
+        roi.delete();
+        trimmed.delete();
         finalMat.delete();
-        finalMat = rotated;
+
+        let cellDiv=document.createElement('div');
+        cellDiv.className='cell';
+        let label=document.createElement('input');
+        label.type='text';
+        label.value=`Photo_${counter}`;
+        label.addEventListener('keydown',(ev)=>{
+          if(ev.key==='Enter'){
+            ev.preventDefault();
+            // you can implement save logic here
+            alert(`Saved ${label.value}`);
+          }
+        });
+        cellDiv.appendChild(canvas);
+        cellDiv.appendChild(label);
+        output.appendChild(cellDiv);
+        counter++;
       }
-      // convert to canvas
-      const canvas = document.createElement('canvas');
-      cv.imshow(canvas, finalMat);
-      outputs.push(canvas);
-      // cleanup
-      srcTri.delete(); dstTri.delete(); M.delete(); warped.delete(); if(trimmed !== finalMat) trimmed.delete(); finalMat.delete();
     }
-
-    // cleanup
-    img.delete(); gray.delete(); blur.delete(); thresh.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
-
-    return outputs;
+    src.delete();
   }
 
-  // --- UI / control flow ---
-  document.getElementById('processBtn').addEventListener('click', async ()=>{
-    if(!originalImg || !originalImg.src){ alert('Load an image first'); return; }
-    if(!cv || !cv.Mat){ alert('OpenCV not ready'); return; }
-    logStatus('Processing... may take a few seconds');
-    const minAreaRatio = parseFloat(document.getElementById('minAreaRatio').value) || 0.0005;
-    const columns = parseInt(document.getElementById('columns').value) || 4;
-    const srcMat = matFromCanvas(srcCanvas);
-    try{
-      extractedImages = extractPhotosFromMat(srcMat, minAreaRatio, columns);
-      const list = document.getElementById('extractedList'); list.innerHTML='';
-      extractedImages.forEach((c,idx)=>{
-        const img = document.createElement('img'); img.className='thumb'; img.src = c.toDataURL('image/jpeg',0.95); img.title = `photo_${idx+1}`; list.appendChild(img);
-      });
-      if(extractedImages.length===0) logStatus('No photos found. Try lowering min area or adjusting columns.'); else logStatus(`Found ${extractedImages.length} photo(s)`);
-      // prepare rename UI
-      currentIndex = 0; prepareRenameUI();
-      document.getElementById('downloadAll').disabled = extractedImages.length===0;
-    }catch(err){ console.error(err); alert('Processing error: '+err); }
-    srcMat.delete();
-  });
-
-  // rename UI logic
-  let currentIndex = 0;
-  const previewImg = document.getElementById('previewImg');
-  const nameInput = document.getElementById('nameInput');
-  const saveNextBtn = document.getElementById('saveNextBtn');
-  const renameStatus = document.getElementById('renameStatus');
-
-  function prepareRenameUI(){
-    if(extractedImages.length===0){ previewImg.src=''; nameInput.disabled=true; saveNextBtn.disabled=true; renameStatus.textContent='No extracted images'; return; }
-    nameInput.disabled=false; saveNextBtn.disabled=false; showCurrent();
-  }
-
-  function showCurrent(){
-    if(currentIndex >= extractedImages.length){ renameStatus.textContent = 'All done.'; previewImg.src=''; nameInput.value=''; nameInput.disabled=true; saveNextBtn.disabled=true; return; }
-    const c = extractedImages[currentIndex]; previewImg.src = c.toDataURL('image/jpeg',0.95);
-    nameInput.value = '';
-    nameInput.focus();
-    renameStatus.textContent = `${currentIndex+1}/${extractedImages.length} — photo_${String(currentIndex+1).padStart(2,'0')}.jpg`;
-  }
-
-  function downloadCanvas(canvas, filename){
-    const a = document.createElement('a'); a.href = canvas.toDataURL('image/jpeg',0.95); a.download = filename; a.style.display='none'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  }
-
-  saveNextBtn.addEventListener('click', ()=>{
-    const newName = nameInput.value.trim();
-    if(!newName){ alert('Please type a new name'); nameInput.focus(); return; }
-    const canvas = extractedImages[currentIndex];
-    let filename = newName;
-    if(!filename.toLowerCase().endsWith('.jpg') && !filename.toLowerCase().endsWith('.jpeg')) filename += '.jpg';
-    downloadCanvas(canvas, filename);
-    currentIndex += 1; showCurrent();
-  });
-
-  // bind Enter to saveNext
-  nameInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); saveNextBtn.click(); } });
-
-  // Download all as zip (optional): include JSZip via dynamic import if user clicks
-  document.getElementById('downloadAll').addEventListener('click', async ()=>{
-    if(extractedImages.length===0) return;
-    // load JSZip dynamically
-    if(typeof JSZip === 'undefined'){
-      const script = document.createElement('script');
-      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
-      document.head.appendChild(script);
-      await new Promise(r=>script.onload=r);
-    }
-    const zip = new JSZip();
-    for(let i=0;i<extractedImages.length;i++){
-      const c = extractedImages[i];
-      const dataUrl = c.toDataURL('image/jpeg',0.95);
-      const binStr = atob(dataUrl.split(',')[1]);
-      const len = binStr.length; const arr = new Uint8Array(len);
-      for(let j=0;j<len;j++) arr[j] = binStr.charCodeAt(j);
-      zip.file(`photo_${String(i+1).padStart(2,'0')}.jpg`, arr);
-    }
-    const content = await zip.generateAsync({type:'blob'});
-    const url = URL.createObjectURL(content);
-    const a = document.createElement('a'); a.href = url; a.download = 'extracted_photos.zip'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  });
-
+  document.getElementById('fileInput').addEventListener('change',onFileSelected);
   </script>
 </body>
 </html>
