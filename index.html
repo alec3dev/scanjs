@@ -2,240 +2,344 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
-  <title>Face scan — capture, align by eyes, crop & download</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Photo Splitter — HTML + JavaScript (single file)</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#111;color:#eee;display:flex;flex-direction:column;align-items:center;gap:12px;padding:12px}
-    video, canvas{max-width:100%;border-radius:8px}
-    .controls{display:flex;gap:8px;flex-wrap:wrap}
-    button,input{padding:8px 12px;border-radius:8px;border:1px solid #333;background:#222;color:#eee}
-    .note{font-size:13px;opacity:.9;max-width:720px}
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:14px}
+    h1{font-size:1.2rem}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .controls{margin:8px 0}
+    canvas{border:1px solid #ddd;max-width:100%}
+    .thumb{width:180px;height:120px;object-fit:cover;border:1px solid #ccc}
+    .preview-area{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+    .status{font-size:0.9rem;color:#444}
+    button{padding:8px 12px}
+    input[type=text]{padding:6px;width:260px}
   </style>
 </head>
 <body>
-  <h2>Face scan — align by eyes, crop & download</h2>
-
-  <video id="video" autoplay muted playsinline width="640" height="480"></video>
-  <canvas id="overlay" width="640" height="480" style="position:relative;display:block;"></canvas>
+  <h1>Photo Splitter (single HTML + JS)</h1>
+  <p>Upload a scanned image that contains multiple photos. Uses OpenCV.js for detection and perspective correction. After extraction you can rename each and download it.</p>
 
   <div class="controls">
-    <button id="snap">Capture & Process</button>
-    <button id="download" disabled>Download result</button>
-    <label><input id="useFront" type="checkbox" checked> Front camera (selfie)</label>
-    <label>Filename: <input id="filename" value="face_scan_" style="width:140px"></label>
+    <input id="fileInput" type="file" accept="image/*">
+    <label> Min area ratio: <input id="minAreaRatio" type="number" value="0.0005" step="0.0001" style="width:90px"></label>
+    <label> Columns: <input id="columns" type="number" value="4" min="1" style="width:60px"></label>
+    <button id="processBtn" disabled>Process</button>
+    <button id="downloadAll" disabled>Download All as ZIP</button>
   </div>
 
-  <p class="note">How this works: the page captures camera frames, detects face & facial landmarks (eyes). It computes the angle between eyes, rotates the image to make eyes horizontal, crops a square region around the face, and produces a downloadable JPG. <strong>Important:</strong> you must host the HTML over HTTPS (or run on localhost) for camera access on iPhone. You also need the face-api.js model files placed in a ./models/ folder next to this file (see instructions below).</p>
+  <div id="status" class="status">OpenCV loading...</div>
 
-  <p class="note" id="status">Status: idle</p>
+  <hr>
+  <div class="row">
+    <div style="flex:1;min-width:320px">
+      <canvas id="srcCanvas"></canvas>
+    </div>
+    <div style="width:360px">
+      <div class="preview-area">
+        <img id="previewImg" class="thumb">
+        <div>
+          <input id="nameInput" type="text" placeholder="Type new name (no extension)" autocomplete="off">
+          <button id="saveNextBtn">Save / Next</button>
+        </div>
+        <div id="renameStatus" class="status"></div>
+      </div>
+    </div>
+  </div>
 
-  <!-- face-api.js from unpkg -->
-  <script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <h3>All extracted</h3>
+  <div id="extractedList" class="row"></div>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
-  // ---------- Configuration ----------
-  const MODEL_PATH = './models' // put model files here (see README comment below)
-  const video = document.getElementById('video')
-  const overlay = document.getElementById('overlay')
-  const ctx = overlay.getContext('2d')
-  const statusEl = document.getElementById('status')
+  // --- Utilities ---
+  function logStatus(s){ document.getElementById('status').textContent = s }
 
-  async function setStatus(t){ statusEl.textContent = 'Status: ' + t }
-
-  // load models
-  async function loadModels(){
-    setStatus('loading models...')
-    // tiny face detector + landmark model is lighter and usually good for eye detection
-    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_PATH)
-    await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_PATH)
-    setStatus('models loaded')
+  // Wait until OpenCV is ready
+  function onOpenCvReady(){
+    logStatus('OpenCV ready. Load an image.');
+    document.getElementById('processBtn').disabled = false;
   }
 
-  // start camera
-  async function startCamera(){
-    const useFront = document.getElementById('useFront').checked
-    const constraints = {
-      audio: false,
-      video: {
-        facingMode: useFront ? 'user' : 'environment',
-        width: { ideal: 1280 },
-        height: { ideal: 960 }
+  // If opencv.js loads it will set cv and call this
+  if (typeof cv !== 'undefined') {
+    if (cv['onRuntimeInitialized']) cv['onRuntimeInitialized'] = onOpenCvReady;
+    else onOpenCvReady();
+  } else {
+    // fallback: when loaded async, opencv will call global onRuntimeInitialized; define it
+    window.onOpenCvReady = onOpenCvReady;
+    // also try to detect cv periodically
+    let tries=0; const t=setInterval(()=>{ if(window.cv){ clearInterval(t); if(cv['onRuntimeInitialized']) cv['onRuntimeInitialized']=onOpenCvReady; else onOpenCvReady(); } tries++; if(tries>80){ clearInterval(t); logStatus('Failed to load OpenCV.js'); } },200)
+  }
+
+  // Read file and draw to canvas
+  const fileInput = document.getElementById('fileInput');
+  const srcCanvas = document.getElementById('srcCanvas');
+  const ctx = srcCanvas.getContext('2d');
+  let originalImg = new Image();
+  let extractedImages = [] // {canvas, blob}
+
+  fileInput.addEventListener('change', e=>{
+    const f = e.target.files && e.target.files[0];
+    if(!f) return;
+    const reader = new FileReader();
+    reader.onload = ev=>{
+      originalImg = new Image();
+      originalImg.onload = ()=>{
+        srcCanvas.width = originalImg.width;
+        srcCanvas.height = originalImg.height;
+        ctx.drawImage(originalImg,0,0);
+        logStatus('Image loaded. Click Process.');
+      };
+      originalImg.src = ev.target.result;
+    };
+    reader.readAsDataURL(f);
+  });
+
+  // --- Image processing functions using OpenCV.js ---
+  function matFromCanvas(canvas){
+    return cv.imread(canvas);
+  }
+
+  function orderPoints(pts){
+    // pts = array of 4 points [[x,y],...]
+    pts.sort((a,b)=>a[0]+a[1]- (b[0]+b[1]));
+    const tl = pts[0];
+    const br = pts[3];
+    pts.sort((a,b)=> (a[0]-a[1]) - (b[0]-b[1]));
+    const tr = pts[0];
+    const bl = pts[3];
+    return [tl,tr,br,bl];
+  }
+
+  function trimBlackBorders(matSrc, threshold=20){
+    let gray = new cv.Mat();
+    cv.cvtColor(matSrc, gray, cv.COLOR_RGBA2GRAY);
+    let mask = new cv.Mat();
+    cv.threshold(gray, mask, threshold, 255, cv.THRESH_BINARY);
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    if(contours.size()===0){ gray.delete(); mask.delete(); contours.delete(); hierarchy.delete(); return matSrc; }
+    // find largest contour
+    let maxArea = 0, maxi=0;
+    for(let i=0;i<contours.size();i++){ const c=contours.get(i); const area = cv.contourArea(c); if(area>maxArea){ maxArea=area; maxi=i;} }
+    const c = contours.get(maxi);
+    const rect = cv.boundingRect(c);
+    const roi = matSrc.roi(rect);
+    let out = roi.clone();
+    // cleanup
+    gray.delete(); mask.delete(); contours.delete(); hierarchy.delete();
+    return out;
+  }
+
+  function isInside(boxSmall, boxBig){
+    return boxSmall.x >= boxBig.x && boxSmall.y >= boxBig.y && (boxSmall.x+boxSmall.w) <= (boxBig.x+boxBig.w) && (boxSmall.y+boxSmall.h) <= (boxBig.y+boxBig.h);
+  }
+
+  function filterInnerContours(contours, bboxes){
+    const keep=[];
+    for(let i=0;i<contours.size();i++){
+      let inside=false; const bi = bboxes[i];
+      for(let j=0;j<bboxes.length;j++){ if(i===j) continue; if(isInside(bboxes[i], bboxes[j])){ inside=true; break; } }
+      if(!inside) keep.push(i);
+    }
+    return keep;
+  }
+
+  function sortContoursFixedGrid(bboxes, columns=4){
+    // bboxes = [{x,y,w,h,index}]
+    // compute centroids
+    bboxes.forEach(b=>{ b.cx = b.x + b.w/2; b.cy = b.y + b.h/2 });
+    bboxes.sort((a,b)=> a.cy - b.cy);
+    const rows=[];
+    for(let i=0;i<bboxes.length;i+=columns){ const row = bboxes.slice(i,i+columns); row.sort((a,b)=> a.cx - b.cx); rows.push(...row); }
+    return rows;
+  }
+
+  function extractPhotosFromMat(srcMat, minAreaRatio=0.0005, columns=4){
+    // returns array of canvases
+    let img = srcMat.clone();
+    let gray = new cv.Mat();
+    cv.cvtColor(img, gray, cv.COLOR_RGBA2GRAY);
+    let blur = new cv.Mat();
+    let ksize = new cv.Size(11,11);
+    cv.GaussianBlur(gray, blur, ksize, 0);
+    let thresh = new cv.Mat();
+    cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU);
+    // determine foreground/back
+    let fgMean = 0, bgMean = 0;
+    try{
+      let fgMask = new cv.Mat();
+      cv.compare(thresh, new cv.Mat(thresh.rows, thresh.cols, thresh.type(), [255,255,255,255]), fgMask, cv.CMP_EQ);
+      const fgPixels = cv.countNonZero(fgMask);
+      if(fgPixels>0){
+        let fg = new cv.Mat();
+        cv.bitwise_and(gray, gray, fg, thresh);
+        fgMean = cv.mean(fg, thresh)[0];
+        fg.delete();
+      }
+      // bg mean
+      let inv = new cv.Mat();
+      cv.bitwise_not(thresh, inv);
+      if(cv.countNonZero(inv)>0){ let bg = new cv.Mat(); cv.bitwise_and(gray, gray, bg, inv); bgMean = cv.mean(bg, inv)[0]; bg.delete(); }
+      fgMask.delete(); inv.delete();
+    }catch(e){ }
+    if(fgMean < bgMean){ cv.bitwise_not(thresh, thresh); }
+    // morphology close
+    let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7,7));
+    cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel, new cv.Point(-1,-1), 2);
+    // find contours
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const imgArea = img.rows * img.cols;
+    const minArea = Math.max(2000, Math.floor(minAreaRatio * imgArea));
+    // filter by area and collect bboxes
+    const bboxes=[];
+    for(let i=0;i<contours.size();i++){
+      const c = contours.get(i);
+      const area = cv.contourArea(c);
+      if(area >= minArea){
+        const r = cv.boundingRect(c);
+        r.index = i;
+        bboxes.push(r);
       }
     }
+    // filter inner
+    const keepIdx = filterInnerContours(contours, bboxes);
+    const filtered = keepIdx.map(i=>bboxes[i]);
+    // sort fixed grid
+    const sorted = sortContoursFixedGrid(filtered, columns);
+    const outputs = [];
+    for(let j=0;j<sorted.length;j++){
+      const r = sorted[j];
+      // get contour points for minAreaRect
+      const c = contours.get(r.index);
+      const rect = cv.minAreaRect(c);
+      const pts = cv.RotatedRect.points(rect);
+      // convert pts to Mat
+      const srcTri = cv.matFromArray(4,1,cv.CV_32FC2,[pts[0].x,pts[0].y, pts[1].x,pts[1].y, pts[2].x,pts[2].y, pts[3].x,pts[3].y]);
+      // compute destination size
+      const widthA = Math.hypot(pts[2].x-pts[3].x, pts[2].y-pts[3].y);
+      const widthB = Math.hypot(pts[1].x-pts[0].x, pts[1].y-pts[0].y);
+      const maxWidth = Math.max(Math.round(widthA), Math.round(widthB));
+      const heightA = Math.hypot(pts[1].x-pts[2].x, pts[1].y-pts[2].y);
+      const heightB = Math.hypot(pts[0].x-pts[3].x, pts[0].y-pts[3].y);
+      const maxHeight = Math.max(Math.round(heightA), Math.round(heightB));
+      const dstTri = cv.matFromArray(4,1,cv.CV_32FC2,[0,0, maxWidth-1,0, maxWidth-1,maxHeight-1, 0,maxHeight-1]);
+      const M = cv.getPerspectiveTransform(srcTri, dstTri);
+      let warped = new cv.Mat();
+      cv.warpPerspective(img, warped, M, new cv.Size(maxWidth, maxHeight));
+      // trim black borders
+      const trimmed = trimBlackBorders(warped,20);
+      // rotate if needed (match python: if h<w rotate cw)
+      let finalMat = trimmed;
+      if(finalMat.rows < finalMat.cols){ // rotate clockwise
+        let rotated = new cv.Mat();
+        cv.rotate(finalMat, rotated, cv.ROTATE_90_CLOCKWISE);
+        finalMat.delete();
+        finalMat = rotated;
+      }
+      // convert to canvas
+      const canvas = document.createElement('canvas');
+      cv.imshow(canvas, finalMat);
+      outputs.push(canvas);
+      // cleanup
+      srcTri.delete(); dstTri.delete(); M.delete(); warped.delete(); if(trimmed !== finalMat) trimmed.delete(); finalMat.delete();
+    }
+
+    // cleanup
+    img.delete(); gray.delete(); blur.delete(); thresh.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+
+    return outputs;
+  }
+
+  // --- UI / control flow ---
+  document.getElementById('processBtn').addEventListener('click', async ()=>{
+    if(!originalImg || !originalImg.src){ alert('Load an image first'); return; }
+    if(!cv || !cv.Mat){ alert('OpenCV not ready'); return; }
+    logStatus('Processing... may take a few seconds');
+    const minAreaRatio = parseFloat(document.getElementById('minAreaRatio').value) || 0.0005;
+    const columns = parseInt(document.getElementById('columns').value) || 4;
+    const srcMat = matFromCanvas(srcCanvas);
     try{
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      video.srcObject = stream
-      await video.play()
-      overlay.width = video.videoWidth || 640
-      overlay.height = video.videoHeight || 480
-      setStatus('camera started')
-    }catch(e){
-      console.error(e); setStatus('camera error: '+e.message)
+      extractedImages = extractPhotosFromMat(srcMat, minAreaRatio, columns);
+      const list = document.getElementById('extractedList'); list.innerHTML='';
+      extractedImages.forEach((c,idx)=>{
+        const img = document.createElement('img'); img.className='thumb'; img.src = c.toDataURL('image/jpeg',0.95); img.title = `photo_${idx+1}`; list.appendChild(img);
+      });
+      if(extractedImages.length===0) logStatus('No photos found. Try lowering min area or adjusting columns.'); else logStatus(`Found ${extractedImages.length} photo(s)`);
+      // prepare rename UI
+      currentIndex = 0; prepareRenameUI();
+      document.getElementById('downloadAll').disabled = extractedImages.length===0;
+    }catch(err){ console.error(err); alert('Processing error: '+err); }
+    srcMat.delete();
+  });
+
+  // rename UI logic
+  let currentIndex = 0;
+  const previewImg = document.getElementById('previewImg');
+  const nameInput = document.getElementById('nameInput');
+  const saveNextBtn = document.getElementById('saveNextBtn');
+  const renameStatus = document.getElementById('renameStatus');
+
+  function prepareRenameUI(){
+    if(extractedImages.length===0){ previewImg.src=''; nameInput.disabled=true; saveNextBtn.disabled=true; renameStatus.textContent='No extracted images'; return; }
+    nameInput.disabled=false; saveNextBtn.disabled=false; showCurrent();
+  }
+
+  function showCurrent(){
+    if(currentIndex >= extractedImages.length){ renameStatus.textContent = 'All done.'; previewImg.src=''; nameInput.value=''; nameInput.disabled=true; saveNextBtn.disabled=true; return; }
+    const c = extractedImages[currentIndex]; previewImg.src = c.toDataURL('image/jpeg',0.95);
+    nameInput.value = '';
+    nameInput.focus();
+    renameStatus.textContent = `${currentIndex+1}/${extractedImages.length} — photo_${String(currentIndex+1).padStart(2,'0')}.jpg`;
+  }
+
+  function downloadCanvas(canvas, filename){
+    const a = document.createElement('a'); a.href = canvas.toDataURL('image/jpeg',0.95); a.download = filename; a.style.display='none'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  }
+
+  saveNextBtn.addEventListener('click', ()=>{
+    const newName = nameInput.value.trim();
+    if(!newName){ alert('Please type a new name'); nameInput.focus(); return; }
+    const canvas = extractedImages[currentIndex];
+    let filename = newName;
+    if(!filename.toLowerCase().endsWith('.jpg') && !filename.toLowerCase().endsWith('.jpeg')) filename += '.jpg';
+    downloadCanvas(canvas, filename);
+    currentIndex += 1; showCurrent();
+  });
+
+  // bind Enter to saveNext
+  nameInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); saveNextBtn.click(); } });
+
+  // Download all as zip (optional): include JSZip via dynamic import if user clicks
+  document.getElementById('downloadAll').addEventListener('click', async ()=>{
+    if(extractedImages.length===0) return;
+    // load JSZip dynamically
+    if(typeof JSZip === 'undefined'){
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+      document.head.appendChild(script);
+      await new Promise(r=>script.onload=r);
     }
-  }
-
-  // compute center point of an array of points
-  function centerPoint(points){
-    const sum = points.reduce((acc,p)=>({x:acc.x+p.x,y:acc.y+p.y}),{x:0,y:0})
-    return {x: sum.x/points.length, y: sum.y/points.length}
-  }
-
-  // rotate image in canvas and return a new canvas
-  function rotateCanvasImage(srcCanvas, angleRad){
-    const c = document.createElement('canvas')
-    const w = srcCanvas.width, h = srcCanvas.height
-    // compute bounding box for rotated image
-    const sin = Math.abs(Math.sin(angleRad)), cos = Math.abs(Math.cos(angleRad))
-    c.width = Math.round(w * cos + h * sin)
-    c.height = Math.round(w * sin + h * cos)
-    const g = c.getContext('2d')
-    g.translate(c.width/2, c.height/2)
-    g.rotate(angleRad)
-    g.drawImage(srcCanvas, -w/2, -h/2)
-    return c
-  }
-
-  // crop a square region centered at cx,cy with size s from canvas (clamped to bounds)
-  function cropSquareFromCanvas(srcCanvas, cx, cy, s){
-    const c = document.createElement('canvas')
-    c.width = s; c.height = s
-    const g = c.getContext('2d')
-    const sx = Math.round(cx - s/2), sy = Math.round(cy - s/2)
-    g.drawImage(srcCanvas, sx, sy, s, s, 0, 0, s, s)
-    return c
-  }
-
-  // main capture -> detect -> align -> crop -> preview
-  async function captureAndProcess(){
-    setStatus('capturing frame')
-    // draw current video into a temp canvas
-    const temp = document.createElement('canvas')
-    temp.width = video.videoWidth
-    temp.height = video.videoHeight
-    const tctx = temp.getContext('2d')
-    tctx.drawImage(video, 0, 0, temp.width, temp.height)
-
-    setStatus('detecting face & landmarks')
-    const detections = await faceapi.detectAllFaces(temp, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks(true)
-    ctx.clearRect(0,0,overlay.width,overlay.height)
-    if(!detections || detections.length===0){ setStatus('no face detected') ; alert('No face detected — try moving camera closer or ensure face is visible') ; return }
-
-    // choose largest detection (closest face)
-    let best = detections[0]
-    let bestArea = 0
-    for(const d of detections){ const r = d.detection.box; const area = r.width*r.height; if(area>bestArea){ best = d; bestArea = area } }
-
-    const box = best.detection.box
-    const landmarks = best.landmarks
-    const leftEyePts = landmarks.getLeftEye()
-    const rightEyePts = landmarks.getRightEye()
-
-    const leftC = centerPoint(leftEyePts)
-    const rightC = centerPoint(rightEyePts)
-
-    // compute angle to rotate so eyes are horizontal
-    const dy = rightC.y - leftC.y
-    const dx = rightC.x - leftC.x
-    const angle = Math.atan2(dy, dx) // radians
-    const angleDeg = angle * 180/Math.PI
-
-    // draw debugging overlay
-    ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.rect(box.x, box.y, box.width, box.height); ctx.stroke()
-    ctx.fillStyle = 'rgba(255,255,0,0.7)'
-    ctx.beginPath(); ctx.arc(leftC.x, leftC.y, 4,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(rightC.x, rightC.y,4,0,Math.PI*2); ctx.fill()
-
-    setStatus('rotating image by ' + (-angleDeg).toFixed(2) + '° and cropping')
-
-    // rotate the temp canvas by -angle (so eyes become horizontal)
-    const rotated = rotateCanvasImage(temp, -angle)
-
-    // compute coordinates of face center in rotated canvas
-    // we need to transform point from original temp coords to rotated canvas coords
-    // approach: compute transform used in rotateCanvasImage — we can map point -> translate to center -> rotate -> translate
-
-    function transformPointToRotated(px, py, srcW, srcH, outW, outH, angleRad){
-      // move origin to center of src
-      const cx = px - srcW/2, cy = py - srcH/2
-      // rotate by -angleRad (because we rotated the image by angleRad into the new canvas in function)
-      const cos = Math.cos(angleRad), sin = Math.sin(angleRad)
-      const rx = cx * cos - cy * sin
-      const ry = cx * sin + cy * cos
-      // translate to out center
-      return { x: Math.round(outW/2 + rx), y: Math.round(outH/2 + ry) }
+    const zip = new JSZip();
+    for(let i=0;i<extractedImages.length;i++){
+      const c = extractedImages[i];
+      const dataUrl = c.toDataURL('image/jpeg',0.95);
+      const binStr = atob(dataUrl.split(',')[1]);
+      const len = binStr.length; const arr = new Uint8Array(len);
+      for(let j=0;j<len;j++) arr[j] = binStr.charCodeAt(j);
+      zip.file(`photo_${String(i+1).padStart(2,'0')}.jpg`, arr);
     }
-
-    const outW = rotated.width, outH = rotated.height
-    const srcW = temp.width, srcH = temp.height
-    // choose center as detection box center
-    const faceCenter = { x: box.x + box.width/2, y: box.y + box.height/2 }
-    const faceCenterRot = transformPointToRotated(faceCenter.x, faceCenter.y, srcW, srcH, outW, outH, -angle)
-
-    // choose crop size: make it square, scale based on detected box and a padding factor
-    const scale = 1.6
-    const s = Math.round(Math.max(box.width, box.height) * scale)
-    // ensure within bounds; clamp s to no more than rotated dims
-    const finalS = Math.min(s, outW, outH)
-
-    const cropped = cropSquareFromCanvas(rotated, faceCenterRot.x, faceCenterRot.y, finalS)
-
-    // show result in overlay by replacing its content
-    overlay.width = cropped.width; overlay.height = cropped.height
-    ctx.drawImage(cropped, 0, 0)
-
-    // enable download button
-    const downloadBtn = document.getElementById('download')
-    downloadBtn.disabled = false
-    // attach data URL to button
-    downloadBtn.onclick = ()=>{
-      const filenameBase = document.getElementById('filename').value || 'face_scan_'
-      const ts = new Date().toISOString().replace(/[:.]/g,'-')
-      const fname = filenameBase + ts + '.jpg'
-      const a = document.createElement('a')
-      a.href = overlay.toDataURL('image/jpeg', 0.92)
-      a.download = fname
-      a.click()
-    }
-
-    setStatus('done — preview shown. Click "Download result" to save')
-  }
-
-  // wire up UI
-  document.getElementById('snap').addEventListener('click', ()=>{
-    captureAndProcess().catch(e=>{console.error(e); setStatus('error: '+e.message)})
-  })
-
-  document.getElementById('useFront').addEventListener('change', ()=>{
-    // restart camera with new facingMode
-    if(video.srcObject){ video.srcObject.getTracks().forEach(t=>t.stop()) }
-    startCamera().catch(e=>console.error(e))
-  })
-
-  // init
-  (async ()=>{
-    try{
-      await loadModels()
-      await startCamera()
-    }catch(e){ console.error(e); setStatus('init error: ' + (e.message||e)) }
-  })()
+    const content = await zip.generateAsync({type:'blob'});
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a'); a.href = url; a.download = 'extracted_photos.zip'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  });
 
   </script>
-
-<!--
-Instructions / Notes for use:
-1. This file expects face-api.js weights/models (tiny_face_detector_model-weights_manifest.json and related bin files, and the face_landmark_68_tiny model) to be placed in a "models" folder next to this HTML file.
-   You can download the models from the face-api.js repo and copy them into ./models. Example required files:
-     - tiny_face_detector_model-weights_manifest.json
-     - tiny_face_detector_model-shard1
-     - face_landmark_68_tiny_model-weights_manifest.json
-     - face_landmark_68_tiny_model-shard1
-
-   If you don't want to host models locally, change MODEL_PATH to a public URL that serves those files.
-
-2. On iPhone (Safari): camera access requires HTTPS or localhost. To test on your phone, either host the file on a web server with HTTPS (e.g., GitHub Pages) or run a local server on your computer and access it via your machine's IP over HTTPS.
-
-3. The code uses a lightweight tiny face detector to keep it reasonably fast on mobile. If detection fails, try moving closer, better lighting, or use a higher-res camera if available.
-
-4. This single-file approach keeps everything in one HTML. The heavy part is the model files which are separate binary files. If you want a fully self-contained single file (models embedded), that's possible but will make the HTML extremely large.
--->
-
 </body>
 </html>
