@@ -2,135 +2,236 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Photo Splitter & Renamer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Face Detection & Cropping Tool</title>
 <style>
-  body{font-family:sans-serif;margin:1rem;}
-  input[type=file]{margin-bottom:1rem;}
-  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
-  .cell{border:1px solid #ccc;padding:4px;text-align:center;}
-  canvas{max-width:100%;display:block;margin:auto;}
-  .btn{margin-top:4px;}
+body {
+  font-family: Arial, sans-serif;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 20px;
+  background-color: #f5f5f5;
+}
+.container {
+  background-color: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+h1 { text-align:center; color:#333; }
+.upload-section {
+  margin-bottom:20px;
+  padding:15px;
+  border:2px dashed #ccc;
+  border-radius:5px;
+  text-align:center;
+}
+.button {
+  background-color:#4CAF50;
+  color:white;
+  padding:10px 15px;
+  border:none;
+  border-radius:4px;
+  cursor:pointer;
+  margin:5px;
+}
+.button:disabled { background-color:#cccccc; cursor:not-allowed; }
+.button:hover:not(:disabled) { background-color:#45a049; }
+.results {
+  margin-top:20px;
+  display:grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px,1fr));
+  gap:10px;
+}
+.face-card {
+  border:1px solid #ddd;
+  border-radius:4px;
+  padding:10px;
+  text-align:center;
+  background-color:#f9f9f9;
+}
+.face-image { max-width:100%; height:auto; border-radius:3px; }
+.status { margin:10px 0; padding:10px; border-radius:4px; }
+.loading { background-color:#e0f7fa; color:#006064; }
+.success { background-color:#e8f5e9; color:#2e7d32; }
+.error { background-color:#ffebee; color:#c62828; }
+textarea { width:100%; height:100px; margin:10px 0; padding:10px; border:1px solid #ddd; border-radius:4px; resize:vertical; }
+.instructions { background-color:#fff3e0; padding:15px; border-radius:4px; margin-bottom:20px; }
+.ratio-display { margin:10px 0; font-weight:bold; color:#333; }
+input.rename-field { width: 80%; margin-top: 5px; padding:4px; border-radius:3px; border:1px solid #ccc; }
 </style>
-<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-<h1>Photo Splitter & Renamer</h1>
-<input type="file" id="fileInput" accept="image/*">
-<div id="output" class="grid"></div>
+<div class="container">
+<h1>Face Detection & Cropping Tool</h1>
 
+<div class="instructions">
+<h3>Instructions:</h3>
+<ol>
+  <li>Upload an image containing faces</li>
+  <li>Click "Detect and Crop Faces" to process</li>
+  <li>Rename each face in the text fields if desired</li>
+  <li>Download individual faces or all as ZIP</li>
+</ol>
+<div class="ratio-display">Crop Ratio: 1.5:2 (Width:Height)</div>
+</div>
+
+<div class="upload-section">
+  <h3>Upload Image</h3>
+  <input type="file" id="imageUpload" accept="image/*">
+  <div id="imagePreview"></div>
+</div>
+
+<div>
+<button id="processButton" class="button" disabled>Detect and Crop Faces</button>
+<button id="downloadAllButton" class="button" disabled>Download All</button>
+</div>
+
+<div id="status" class="status"></div>
+
+<h3>Detected Faces:</h3>
+<div id="results" class="results"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
-function trimBlackBorders(src,threshold=20){
-  let gray=new cv.Mat();
-  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY,0);
-  let mask=new cv.Mat();
-  cv.threshold(gray,mask,threshold,255,cv.THRESH_BINARY);
-  let contours=new cv.MatVector();
-  let hierarchy=new cv.Mat();
-  cv.findContours(mask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
-  let rect=new cv.Rect(0,0,src.cols,src.rows);
-  if(contours.size()>0){
-    let maxA=0;
-    for(let i=0;i<contours.size();i++){
-      let area=cv.contourArea(contours.get(i));
-      if(area>maxA){
-        maxA=area;
-        rect=cv.boundingRect(contours.get(i));
-      }
-    }
-  }
-  let trimmed=src.roi(rect).clone();
-  gray.delete();mask.delete();contours.delete();hierarchy.delete();
-  return trimmed;
+let imageFile=null, detectedFaces=[];
+
+const imageUpload=document.getElementById('imageUpload');
+const imagePreview=document.getElementById('imagePreview');
+const processButton=document.getElementById('processButton');
+const downloadAllButton=document.getElementById('downloadAllButton');
+const statusDiv=document.getElementById('status');
+const resultsDiv=document.getElementById('results');
+
+imageUpload.addEventListener('change', handleImageUpload);
+processButton.addEventListener('click', processImage);
+downloadAllButton.addEventListener('click', downloadAllFaces);
+
+async function initializeFaceAPI(){
+  statusDiv.textContent='Loading models...'; statusDiv.className='status loading';
+  try{
+    await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
+    await faceapi.nets.faceLandmark68Net.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
+    statusDiv.textContent='Models loaded. Ready.';
+    statusDiv.className='status success';
+  }catch(e){ statusDiv.textContent=`Error: ${e.message}`; statusDiv.className='status error'; console.error(e); }
 }
 
-function onFileSelected(e){
-  const file=e.target.files[0];
-  if(!file)return;
+function handleImageUpload(event){
+  const file=event.target.files[0];
+  if(!file) return;
+  imageFile=file; resultsDiv.innerHTML=''; detectedFaces=[];
+  downloadAllButton.disabled=true;
   const reader=new FileReader();
-  reader.onload=function(ev){
-    const img=new Image();
-    img.onload=function(){processImage(img);};
-    img.src=ev.target.result;
+  reader.onload=function(e){
+    imagePreview.innerHTML=`<img src="${e.target.result}" style="max-width:100%; max-height:300px;">`;
+    processButton.disabled=false;
   };
   reader.readAsDataURL(file);
 }
 
-function downloadCanvas(canvas,filename){
-  canvas.toBlob(function(blob){
-    const link=document.createElement('a');
-    link.download=filename;
-    link.href=URL.createObjectURL(blob);
-    link.click();
-    URL.revokeObjectURL(link.href);
-  },'image/png');
+function centerPoint(points){
+  const xs=points.map(p=>p.x), ys=points.map(p=>p.y);
+  return {x: xs.reduce((a,b)=>a+b,0)/points.length, y: ys.reduce((a,b)=>a+b,0)/points.length};
 }
 
-function processImage(img){
-  let src=cv.imread(img);
-  let rows=4; // adjust
-  let cols=4; // adjust
-  let cellW=Math.floor(src.cols/cols);
-  let cellH=Math.floor(src.rows/rows);
+async function processImage(){
+  if(!imageFile) return;
+  statusDiv.textContent='Detecting faces...'; statusDiv.className='status loading';
+  processButton.disabled=true;
+  try{
+    const img=await faceapi.bufferToImage(imageFile);
+    const options=new faceapi.TinyFaceDetectorOptions({inputSize:512, scoreThreshold:0.3});
+    let detections=await faceapi.detectAllFaces(img, options).withFaceLandmarks();
+    if(!detections.length){ statusDiv.textContent='No faces detected.'; statusDiv.className='status error'; processButton.disabled=false; return; }
 
-  const out=document.getElementById('output');
-  out.innerHTML='';
-  let counter=1;
+    detectedFaces=detections.map((det,index)=>{
+      const lm=det.landmarks, box=det.detection.box;
+      const nose=centerPoint(lm.getNose()), leftEye=centerPoint(lm.getLeftEye()), rightEye=centerPoint(lm.getRightEye());
+      const angle=Math.atan2(rightEye.y-leftEye.y, rightEye.x-leftEye.x);
+      const cropRatioW=1.5, cropRatioH=2;
+      let cropH=box.height*1.8, cropW=cropH*cropRatioW/cropRatioH;
+      let cropX=nose.x-cropW/2, cropY=nose.y-cropH/2;
+      cropX=Math.max(0, Math.min(cropX, img.width-cropW));
+      cropY=Math.max(0, Math.min(cropY, img.height-cropH));
+      if(cropW<=0||cropH<=0) return null;
+      const canvas=document.createElement('canvas'); canvas.width=cropW; canvas.height=cropH;
+      const ctx=canvas.getContext('2d'); ctx.translate(cropW/2,cropH/2); ctx.rotate(-angle);
+      ctx.drawImage(img,cropX,cropY,cropW,cropH,-cropW/2,-cropH/2,cropW,cropH);
+      ctx.setTransform(1,0,0,1,0,0);
+      return {id:`face_${index+1}`, imageData:canvas.toDataURL('image/jpeg'), x:cropX, y:cropY};
+    }).filter(f=>f!==null);
 
-  for(let r=0;r<rows;r++){
-    for(let c=0;c<cols;c++){
-      let rect=new cv.Rect(c*cellW,r*cellH,cellW,cellH);
-      let roi=src.roi(rect);
+    // Sort top-left → bottom-right
+    detectedFaces.sort((a,b)=>{ const margin=20; if(Math.abs(a.y-b.y)<margin) return a.x-b.x; return a.y-b.y; });
 
-      let trimmed=trimBlackBorders(roi,20);
+    displayResults();
+    statusDiv.textContent=`Processed ${detectedFaces.length} faces.`; statusDiv.className='status success';
+    downloadAllButton.disabled=false;
+  }catch(e){ statusDiv.textContent=`Error: ${e.message}`; statusDiv.className='status error'; console.error(e);}
+  finally{ processButton.disabled=false; }
+}
 
-      // optional rotation like Python
-      let finalMat=trimmed;
-      if(finalMat.rows<finalMat.cols){
-        let rotated=new cv.Mat();
-        cv.rotate(finalMat,rotated,cv.ROTATE_90_CLOCKWISE);
-        finalMat.delete();
-        finalMat=rotated;
-      }
+function displayResults(){
+  resultsDiv.innerHTML='';
+  detectedFaces.forEach((face,index)=>{
+    const card=document.createElement('div'); card.className='face-card';
+    card.innerHTML=`
+      <img src="${face.imageData}" class="face-image" alt="Face">
+      <input type="text" class="rename-field" value="" placeholder="Enter name for face" data-index="${index}">
+      <button class="button download-btn" data-index="${index}">Download</button>
+    `;
+    resultsDiv.appendChild(card);
+  });
 
-      // draw to canvas
-      let canvas=document.createElement('canvas');
-      cv.imshow(canvas,finalMat);
+  document.querySelectorAll('.rename-field').forEach(input=>{
+    input.addEventListener('input',()=>{
+      const idx=parseInt(input.dataset.index);
+      detectedFaces[idx].id = input.value.trim() || `face_${idx+1}`;
+    });
+  });
 
-      // cleanup mats
-      roi.delete();
-      trimmed.delete();
-      finalMat.delete();
+  document.querySelectorAll('.download-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{ 
+      const idx=parseInt(btn.dataset.index);
+      downloadFace(idx); 
+    });
+  });
+}
 
-      // create UI for renaming & download
-      const cell=document.createElement('div');
-      cell.className='cell';
-      const input=document.createElement('input');
-      input.type='text';
-      input.value=`photo_${counter}`;
-      input.addEventListener('keydown',ev=>{
-        if(ev.key==='Enter'){
-          ev.preventDefault();
-          downloadCanvas(canvas,input.value+'.png');
-        }
-      });
-      const btn=document.createElement('button');
-      btn.textContent='Save';
-      btn.className='btn';
-      btn.onclick=()=>downloadCanvas(canvas,input.value+'.png');
 
-      cell.appendChild(canvas);
-      cell.appendChild(input);
-      cell.appendChild(btn);
-      out.appendChild(cell);
+function downloadFace(index){
+  const face=detectedFaces[index]; if(!face) return;
+  const link=document.createElement('a'); link.href=face.imageData; link.download=`${face.id}.jpg`;
+  document.body.appendChild(link); link.click(); document.body.removeChild(link);
+}
 
-      counter++;
-    }
+async function downloadAllFaces(){
+  if(!detectedFaces.length) return;
+  const zip=new JSZip();
+  detectedFaces.forEach(face=>{
+    const data=face.imageData.split(',')[1];
+    zip.file(`${face.id}.jpg`, base64ToBlob(data,'image/jpeg'));
+  });
+  const content=await zip.generateAsync({type:'blob'});
+  const link=document.createElement('a'); link.href=URL.createObjectURL(content); link.download='faces.zip';
+  document.body.appendChild(link); link.click(); document.body.removeChild(link);
+}
+
+function base64ToBlob(base64,mimeType){
+  const byteCharacters=atob(base64); const byteArrays=[];
+  for(let offset=0;offset<byteCharacters.length;offset+=512){
+    const slice=byteCharacters.slice(offset,offset+512);
+    const byteNumbers=new Array(slice.length); for(let i=0;i<slice.length;i++) byteNumbers[i]=slice.charCodeAt(i);
+    byteArrays.push(new Uint8Array(byteNumbers));
   }
-  src.delete();
+  return new Blob(byteArrays,{type:mimeType});
 }
 
-document.getElementById('fileInput').addEventListener('change',onFileSelected);
+initializeFaceAPI();
 </script>
 </body>
 </html>
+
